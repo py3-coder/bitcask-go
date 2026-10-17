@@ -1,0 +1,2 @@
+# bitcask-go
+Bitcask
