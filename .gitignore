@@ -1,0 +1,11 @@
+# Local database files
+data/
+
+# Go build outputs
+*.exe
+*.out
+/bin/
+
+# IDE settings
+.vscode/
+.idea/
