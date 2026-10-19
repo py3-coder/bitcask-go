@@ -32,19 +32,25 @@ func TestRecoveryTruncatesIncompleteTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if _, err := f.Write([]byte{0, 0, 0}); err != nil {
+		f.Close()
 		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Reopening should discard the incomplete tail.
+	// Reopening should discard only the incomplete tail.
 	db, err = Open(dir)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open after incomplete tail failed: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("Close failed: %v", err)
+		}
+	}()
 
 	got, err := db.Get("name")
 	if err != nil {
@@ -54,15 +60,19 @@ func TestRecoveryTruncatesIncompleteTail(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, "Saurabh")
 	}
 
-	if _, err := db.Get("language"); err != nil {
+	got, err = db.Get("language")
+	if err != nil {
 		t.Fatalf("valid record was lost: %v", err)
+	}
+	if string(got) != "Go" {
+		t.Fatalf("got %q, want %q", got, "Go")
 	}
 
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size() != int64(19+18) {
+	if info.Size() != 37 {
 		t.Fatalf("file size = %d, want 37", info.Size())
 	}
 }
@@ -78,7 +88,6 @@ func TestRecoveryTruncatesIncompleteRecordBody(t *testing.T) {
 	if err := db.Put("name", []byte("Saurabh")); err != nil {
 		t.Fatal(err)
 	}
-
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -97,8 +106,8 @@ func TestRecoveryTruncatesIncompleteRecordBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	if _, err := f.Write(partial); err != nil {
+		f.Close()
 		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {
@@ -107,9 +116,13 @@ func TestRecoveryTruncatesIncompleteRecordBody(t *testing.T) {
 
 	db, err = Open(dir)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open after incomplete body failed: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("Close failed: %v", err)
+		}
+	}()
 
 	got, err := db.Get("name")
 	if err != nil {
@@ -145,25 +158,28 @@ func TestRecoveryRejectsCorruptionInMiddle(t *testing.T) {
 	if err := db.Put("third", []byte("three")); err != nil {
 		t.Fatal(err)
 	}
-
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
 	path := filepath.Join(dir, "000001.data")
 
-	// First record size = 8 + len("first") + len("one") = 16.
-	// Corrupt the second record's header at offset 16.
+	// The first record occupies 8 + 5 + 3 = 16 bytes.
+	// Corrupt the second record's key-length field at offset 16.
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Set the second record's key length to an impossible value.
 	corruptHeader := []byte{0xFF, 0xFF, 0xFF, 0xFF}
-	if _, err := f.WriteAt(corruptHeader, 16); err != nil {
+	if n, err := f.WriteAt(corruptHeader, 16); err != nil {
+		f.Close()
 		t.Fatal(err)
+	} else if n != len(corruptHeader) {
+		f.Close()
+		t.Fatalf("wrote %d bytes of corrupt header, want %d", n, len(corruptHeader))
 	}
+
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -173,15 +189,19 @@ func TestRecoveryRejectsCorruptionInMiddle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = Open(dir)
+	reopenedDB, err := Open(dir)
 	if err == nil {
-		db.Close()
+		if closeErr := reopenedDB.Close(); closeErr != nil {
+			t.Errorf("Close unexpectedly opened DB: %v", closeErr)
+		}
 		t.Fatal("expected recovery error for corrupted record")
 	}
 
+	// Open must close any file handles it opened before returning an error.
+	// This stat also checks that the file remains accessible.
 	after, err := os.Stat(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("could not stat corrupted file after failed Open: %v", err)
 	}
 
 	if after.Size() != before.Size() {

@@ -7,13 +7,15 @@ import (
 )
 
 func TestConcurrentPutAndGet(t *testing.T) {
-	dir := t.TempDir()
-
-	db, err := Open(dir)
+	db, err := Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("Close failed: %v", err)
+		}
+	}()
 
 	const (
 		writers         = 5
@@ -23,7 +25,7 @@ func TestConcurrentPutAndGet(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	// Writers use separate keys so final values are predictable.
+	// Writers use distinct keys so their expected values are deterministic.
 	for w := 0; w < writers; w++ {
 		wg.Add(1)
 
@@ -42,7 +44,7 @@ func TestConcurrentPutAndGet(t *testing.T) {
 		}(w)
 	}
 
-	// Readers repeatedly access keys while writers are active.
+	// Reads may happen before a key has been written.
 	for r := 0; r < readers; r++ {
 		wg.Add(1)
 
@@ -55,8 +57,6 @@ func TestConcurrentPutAndGet(t *testing.T) {
 
 				value, err := db.Get(key)
 				if err != nil {
-					// A key might not have been written yet.
-					// Missing keys are valid during concurrent execution.
 					continue
 				}
 
@@ -74,7 +74,7 @@ func TestConcurrentPutAndGet(t *testing.T) {
 
 	wg.Wait()
 
-	// Verify every written key after all goroutines have finished.
+	// Once all writers finish, every key must exist with its expected value.
 	for w := 0; w < writers; w++ {
 		for i := 0; i < writesPerWorker; i++ {
 			key := fmt.Sprintf("worker-%d-key-%d", w, i)
@@ -100,10 +100,20 @@ func TestConcurrentWritesSameKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Ensure the currently assigned DB is closed even if a later
+	// assertion fails. The variable is reassigned after reopening.
+	defer func() {
+		if db != nil {
+			if err := db.Close(); err != nil {
+				t.Errorf("Close failed: %v", err)
+			}
+		}
+	}()
+
 	const workers = 100
 
 	var wg sync.WaitGroup
-	errors := make(chan error, workers)
+	errs := make(chan error, workers)
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -113,19 +123,23 @@ func TestConcurrentWritesSameKey(t *testing.T) {
 
 			value := []byte(fmt.Sprintf("value-%d", id))
 			if err := db.Put("shared-key", value); err != nil {
-				errors <- fmt.Errorf("worker %d: %w", id, err)
+				errs <- fmt.Errorf("worker %d: %w", id, err)
 			}
 		}(i)
 	}
 
 	wg.Wait()
-	close(errors)
+	close(errs)
 
-	for err := range errors {
+	for err := range errs {
 		t.Error(err)
 	}
 
-	// Capture the value after every writer has finished.
+	// Don't continue if any write failed.
+	if t.Failed() {
+		return
+	}
+
 	finalValue, err := db.Get("shared-key")
 	if err != nil {
 		t.Fatal(err)
@@ -134,13 +148,13 @@ func TestConcurrentWritesSameKey(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	db = nil
 
-	// Reopen to verify the index is rebuilt consistently.
-	db, err = Open(dir)
+	reopenedDB, err := Open(dir)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("reopen failed: %v", err)
 	}
-	defer db.Close()
+	db = reopenedDB
 
 	recoveredValue, err := db.Get("shared-key")
 	if err != nil {
