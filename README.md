@@ -97,7 +97,7 @@ This project is a hands-on exploration of storage-engine internals, including:
 - [x] Incomplete trailing-record recovery
 - [x] Concurrent reads and writes
 - [x] Log compaction and obsolete-record cleanup
-- [ ] Tombstone-based deletion
+- [x] Tombstone-based deletion
 - [ ] Crash-safe compaction and stronger recovery guarantees
 - [ ] Benchmarks and performance testing
 
