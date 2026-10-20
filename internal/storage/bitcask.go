@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -12,13 +13,16 @@ import (
 )
 
 type Entry struct {
-	fileId int
-	offset int64
-	size   int64
+	fileId    int
+	offset    int64
+	size      int64
+	isDeleted bool
 }
 
 const maxRecordSize int64 = 2 << 20       // 2MB
 const maxFileSize int64 = 2 * 1024 * 1024 // 2MB
+const tombstone = "__BITCASK_TOMBSTONE__"
+
 type Bitcask struct {
 	mu           sync.RWMutex
 	dir          string
@@ -144,15 +148,25 @@ func (db *Bitcask) RebuildIndex() error {
 				return fmt.Errorf("failed to read record: %v", err)
 			}
 			//decode the record to get the key:
-			key, _, err := decodeRecord(record)
+			key, value, err := decodeRecord(record)
 			if err != nil {
 				return fmt.Errorf("failed to decode record: %v", err)
 			}
-			//update the index:
-			db.index[key] = Entry{
-				fileId: fileID,
-				offset: offset,
-				size:   recordSize,
+			//update the index: but also need extra check for deleted value:
+			if bytes.Equal(value, []byte(tombstone)) {
+				db.index[key] = Entry{
+					fileId:    fileID,
+					offset:    offset,
+					size:      recordSize,
+					isDeleted: true,
+				}
+			} else {
+				db.index[key] = Entry{
+					fileId:    fileID,
+					offset:    offset,
+					size:      recordSize,
+					isDeleted: false,
+				}
 			}
 			offset += recordSize
 		}
@@ -171,8 +185,20 @@ func (db *Bitcask) Close() error {
 	return db.activeFile.Close()
 }
 
-// Put stores a key-value pair in the Bitcask database.
+//the reason we took out is actually while delete call the put correct
+// then put would have take own lock and after done it have release the lock after reasing suppose some
+//put/delete change the value
+// to make delete atomic::
+
 func (db *Bitcask) Put(key string, value []byte) error {
+	//lock the mutex to ensure thread safety during write operations
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.putLocked(key, value)
+}
+
+// Put stores a key-value pair in the Bitcask database.
+func (db *Bitcask) putLocked(key string, value []byte) error {
 	//encode the record:
 	record, err := encodeRecord(key, value)
 	if err != nil {
@@ -184,9 +210,6 @@ func (db *Bitcask) Put(key string, value []byte) error {
 	if int64(len(record)) > maxFileSize {
 		return fmt.Errorf("record size %d exceeds maximum file size %d", len(record), maxFileSize)
 	}
-	//lock the mutex to ensure thread safety during write operations
-	db.mu.Lock()
-	defer db.mu.Unlock()
 
 	//check the file size limit:
 	if db.writeOffset+int64(len(record)) > maxFileSize {
@@ -243,9 +266,10 @@ func (db *Bitcask) Put(key string, value []byte) error {
 	db.writeOffset += int64(n)
 	//update the index:
 	db.index[key] = Entry{
-		fileId: db.activeFileId,
-		offset: offset,
-		size:   int64(n),
+		fileId:    db.activeFileId,
+		offset:    offset,
+		size:      int64(n),
+		isDeleted: false,
 	}
 	return nil
 }
@@ -257,7 +281,7 @@ func (db *Bitcask) Get(key string) ([]byte, error) {
 
 	//find the key in the index:
 	entry, ok := db.index[key]
-	if !ok {
+	if !ok || entry.isDeleted {
 		return nil, fmt.Errorf("key not found: %s", key)
 	}
 	// //move the cursor to the file offset:
@@ -631,4 +655,27 @@ func createCompactionFile(dir string, fileID int) (*os.File, error) {
 	filePath := filepath.Join(dir, fileName)
 
 	return os.OpenFile(filePath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
+}
+
+// delete - kind of put internally ::::
+func (db *Bitcask) Delete(key string) error {
+	if key == "" {
+		return fmt.Errorf("key cannot be empty")
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if err := db.putLocked(key, []byte(tombstone)); err != nil {
+		return err
+	}
+
+	entry, exists := db.index[key]
+	if !exists {
+		return fmt.Errorf("key not found: %s", key)
+	}
+
+	entry.isDeleted = true
+	db.index[key] = entry
+
+	return nil
 }

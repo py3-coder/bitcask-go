@@ -168,3 +168,77 @@ func TestConcurrentWritesSameKey(t *testing.T) {
 		)
 	}
 }
+
+func TestDeleteWritesTombstone(t *testing.T) {
+    db, err := Open(t.TempDir())
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer db.Close()
+
+    if err := db.Put("name", []byte("Saurabh")); err != nil {
+        t.Fatal(err)
+    }
+
+    if err := db.Delete("name"); err != nil {
+        t.Fatal(err)
+    }
+
+    value, err := db.Get("name")
+    if err == nil {
+        t.Fatalf("expected key-not-found error, got value %q", value)
+    }
+}
+
+func TestDeleteKey(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put("name", []byte("Saurabh")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Delete("name"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Get("name")
+	if err == nil {
+		t.Fatal("expected error when getting deleted key")
+	}
+}
+func TestDeletePersistsAfterReopen(t *testing.T) {
+    dir := t.TempDir()
+
+    db, err := Open(dir)
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    if err := db.Put("name", []byte("Saurabh")); err != nil {
+        t.Fatal(err)
+    }
+
+    if err := db.Delete("name"); err != nil {
+        t.Fatal(err)
+    }
+
+    if err := db.Close(); err != nil {
+        t.Fatal(err)
+    }
+
+    // Reopen should rebuild the index from disk.
+    db, err = Open(dir)
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer db.Close()
+
+    value, err := db.Get("name")
+    if err == nil {
+        t.Fatalf("expected deleted key to be missing, got %q", value)
+    }
+}
