@@ -107,6 +107,92 @@ This is an experimental learning project, not a production-ready database.
 
 Although the project implements segment rotation, index recovery, concurrency controls, and compaction, further work is needed to validate crash consistency, compaction failure handling, durability guarantees, and behavior under heavy concurrent workloads.
 
+
+## 🏗️ Architecture
+
+```mermaid
+flowchart TD
+    Client["Client API"]
+
+    subgraph Operations["Core Operations"]
+        Put["Put(key, value)"]
+        Get["Get(key)"]
+        Delete["Delete(key)"]
+    end
+
+    subgraph WritePath["Write Path"]
+        Encode["Encode Binary Record"]
+        Rotate{"Segment size limit reached?"}
+        NewSegment["Create New Segment"]
+        Append["Append Record"]
+        Sync["Sync to Disk"]
+    end
+
+    subgraph Storage["Persistent Storage"]
+        Segments[("Numbered Data Segments")]
+    end
+
+    subgraph Indexing["In-Memory Index"]
+        Index[("Hash Map: key → fileID, offset, size")]
+        Deleted{"Entry deleted?"}
+    end
+
+    subgraph ReadPath["Read Path"]
+        Locate["Locate Segment and Offset"]
+        Read["ReadAt"]
+        Decode["Decode Record"]
+        Value["Return Value"]
+        NotFound["Return Key Not Found"]
+    end
+
+    subgraph Recovery["Startup Recovery"]
+        Open["Open Database"]
+        Scan["Scan Segments in Order"]
+        Rebuild["Rebuild Index"]
+        Tail["Recover Incomplete Active-Segment Tail"]
+    end
+
+    Client --> Put
+    Client --> Get
+    Client --> Delete
+
+    Put --> Encode
+    Encode --> Rotate
+    Rotate -- Yes --> NewSegment
+    NewSegment --> Append
+    Rotate -- No --> Append
+    Append --> Segments
+    Append --> Sync
+    Sync --> Index
+
+    Delete --> AppendTombstone["Append Tombstone"]
+    AppendTombstone --> Segments
+    AppendTombstone --> Sync
+    Sync --> MarkDeleted["Mark Index Entry Deleted"]
+    MarkDeleted --> Index
+
+    Get --> Index
+    Index --> Deleted
+    Deleted -- Yes --> NotFound
+    Deleted -- No --> Locate
+    Locate --> Read
+    Read --> Segments
+    Read --> Decode
+    Decode --> Value
+
+    Open --> Scan
+    Scan --> Segments
+    Scan --> Rebuild
+    Scan --> Tail
+    Tail --> Rebuild
+    Rebuild --> Index
+```
+
+The database appends records to numbered data segments and maintains an in-memory hash index pointing to the latest record for each key. Reads use the index to locate the record on disk. Deletes append tombstones, while startup recovery reconstructs the index by scanning existing segments.
+
+Compaction rewrites live records and removes obsolete versions. Crash-safe compaction and stronger recovery guarantees remain areas for further validation.
+
+
 ## 📚 Inspiration
 
 Inspired by the [Bitcask storage model](https://riak.com/assets/bitcask-intro.pdf), with the goal of understanding database internals by implementing the core concepts from scratch.
