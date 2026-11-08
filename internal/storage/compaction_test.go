@@ -172,3 +172,120 @@ func TestCompactionSurvivesReopen(t *testing.T) {
 		}
 	}
 }
+func TestCompactionRemovesDeletedKeys(t *testing.T) {
+	db := openTestDB(t)
+
+	writeLargeValue(t, db, "key-1")
+
+	if err := db.Delete("key-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force rotation by writing another large record.
+	writeLargeValue(t, db, "key-2")
+
+	if err := db.Compaction(); err != nil {
+		t.Fatalf("compaction failed: %v", err)
+	}
+
+	if _, exists := db.index["key-1"]; exists {
+		t.Fatal("deleted key still exists in index")
+	}
+
+	if _, err := db.Get("key-1"); err == nil {
+		t.Fatal("expected deleted key to be absent")
+	}
+}
+
+func TestCompactionDeletedKeysPersistAfterReopen(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeLargeValue(t, db, "key-1")
+
+	if err := db.Delete("key-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	writeLargeValue(t, db, "key-2")
+
+	if err := db.Compaction(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Get("key-1"); err == nil {
+		t.Fatal("deleted key reappeared after reopen")
+	}
+}
+
+func TestCompactionPreservesNonDeletedKeys(t *testing.T) {
+	db := openTestDB(t)
+
+	writeLargeValue(t, db, "deleted")
+
+	if err := db.Delete("deleted"); err != nil {
+		t.Fatal(err)
+	}
+
+	// This write triggers rotation.
+	writeLargeValue(t, db, "alive")
+
+	if err := db.Compaction(); err != nil {
+		t.Fatalf("compaction failed: %v", err)
+	}
+
+	if _, err := db.Get("deleted"); err == nil {
+		t.Fatal("deleted key should not exist")
+	}
+
+	// alive is in the active segment and must survive compaction.
+	assertValue(t, db, "alive", bytes.Repeat([]byte("x"), 1024*1024))
+}
+func TestPutAfterCompactionSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeLargeValue(t, db, "key-1")
+	writeLargeValue(t, db, "key-2")
+
+	if err := db.Compaction(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write after compaction
+	if err := db.Put("key-3", []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	assertValue(t, db, "key-1", bytes.Repeat([]byte("x"), 1024*1024))
+	assertValue(t, db, "key-2", bytes.Repeat([]byte("x"), 1024*1024))
+	assertValue(t, db, "key-3", []byte("hello"))
+}

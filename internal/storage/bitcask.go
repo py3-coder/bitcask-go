@@ -33,41 +33,65 @@ type Bitcask struct {
 }
 
 func Open(dir string) (*Bitcask, error) {
-	//create or open the dir.
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create directory: %v", err)
-	}
-	//open the data file:
-	path := dir + "/000001.data"
-	//open mode are read-write, create if not exists, append to the end of the file.
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %v", err)
+		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	//get the info about file to get the current size:
+	// Find the highest existing data file ID.
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	activeFileID := 1
+
+	for _, f := range files {
+		if f.IsDir() || !strings.HasSuffix(f.Name(), ".data") {
+			continue
+		}
+
+		idStr := strings.TrimSuffix(f.Name(), ".data")
+		id, err := strconv.Atoi(idStr)
+		if err != nil {
+			continue
+		}
+
+		if id > activeFileID {
+			activeFileID = id
+		}
+	}
+
+	// Open the highest-ID data file.
+	path := filepath.Join(dir, fmt.Sprintf("%06d.data", activeFileID))
+
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()
 		return nil, err
 	}
-	//print the file path and size for debugging:
+
 	fmt.Println("Data file:", path)
 	fmt.Println("Existing file size:", info.Size())
 
 	db := &Bitcask{
 		mu:           sync.RWMutex{},
 		dir:          dir,
-		activeFileId: 1,
+		activeFileId: activeFileID,
 		activeFile:   file,
 		writeOffset:  info.Size(),
 		index:        make(map[string]Entry),
 	}
-	//rebuild the index from the existing data file:
+
 	if err := db.RebuildIndex(); err != nil {
-		file.Close()
+		db.activeFile.Close()
 		return nil, err
 	}
+
 	return db, nil
 }
 
@@ -91,6 +115,7 @@ func (db *Bitcask) RebuildIndex() error {
 		if err != nil {
 			return fmt.Errorf("failed to open file %s: %w", filePath, err)
 		}
+		defer currfile.Close()
 		//read the file and rebuild the index:
 		//move the cursor to the start of the file:
 		_, err = currfile.Seek(0, io.SeekStart)
@@ -440,6 +465,7 @@ func (db *Bitcask) Compaction() error {
 	var newOffset int64 = 0
 	compactedEntries := make(map[string]Entry)
 	compactionFiles := []*os.File{newFile}
+	tombstoneKeys := make(map[string]struct{})
 
 	// close all temporary output files if we return early:
 	defer func() {
@@ -530,59 +556,66 @@ func (db *Bitcask) Compaction() error {
 			entry, exists := db.index[key]
 			if exists && entry.fileId == fileID && entry.offset == offset {
 				// this is the latest record keep it:
-				//check the file size limit:
-				if newOffset+recordSize > maxFileSize {
-					//we are not able write in currfile:
-					//creat new file and switch the active file to the new file:
-					//need to create new file again:
-					if recordSize > maxFileSize {
+				if entry.isDeleted {
+					// latest record is tombstone
+					// do not copy it into compacted output
+					tombstoneKeys[key] = struct{}{}
+				} else {
+					//compaction logic:
+					//check the file size limit:
+					if newOffset+recordSize > maxFileSize {
+						//we are not able write in currfile:
+						//creat new file and switch the active file to the new file:
+						//need to create new file again:
+						if recordSize > maxFileSize {
+							_ = currfile.Close()
+							return fmt.Errorf("record exceeds maximum file size")
+						}
+						//sync : os cache the page in ram , doing syc that data is written to disk:
+						//one thing we are loosing if we do not sync is if the system crashes
+						//before the data is flushed to disk, we will lose the data.
+						// Sync each output file after copying is complete, not each record.
+
+						if err := newFile.Sync(); err != nil {
+							_ = currfile.Close()
+							return fmt.Errorf("sync compacted data file: %w", err)
+						}
+
+						newFileID++
+						//new next file create
+						nextFile, err := createCompactionFile(db.dir, newFileID)
+						if err != nil {
+							_ = currfile.Close()
+							return fmt.Errorf("failed to create next compaction file: %w", err)
+						}
+						//updated the newfile with next file
+						newFile = nextFile
+						//add the newFile in list:
+						compactionFiles = append(compactionFiles, newFile)
+						newOffset = 0
+					}
+
+					//seek to the write offset in the file:
+					// WriteAt uses the explicit offset, so no Seek is needed.
+					//write the record to the file:
+					n, err := newFile.WriteAt(record, newOffset)
+					if err != nil || n != len(record) {
 						_ = currfile.Close()
-						return fmt.Errorf("record exceeds maximum file size")
+						if err != nil {
+							return fmt.Errorf("failed to write record: %w", err)
+						}
+						return fmt.Errorf("incomplete write: wrote %d of %d bytes", n, len(record))
 					}
-					//sync : os cache the page in ram , doing syc that data is written to disk:
-					//one thing we are loosing if we do not sync is if the system crashes
-					//before the data is flushed to disk, we will lose the data.
-					// Sync each output file after copying is complete, not each record.
+					//update the index:
+					compactedEntries[key] = Entry{
+						fileId: newFileID,
+						offset: newOffset,
+						size:   recordSize,
+					}
 
-					if err := newFile.Sync(); err != nil {
-						_ = currfile.Close()
-						return fmt.Errorf("sync compacted data file: %w", err)
-					}
-
-					newFileID++
-					//new next file create
-					nextFile, err := createCompactionFile(db.dir, newFileID)
-					if err != nil {
-						_ = currfile.Close()
-						return fmt.Errorf("failed to create next compaction file: %w", err)
-					}
-					//updated the newfile with next file
-					newFile = nextFile
-					//add the newFile in list:
-					compactionFiles = append(compactionFiles, newFile)
-					newOffset = 0
+					//increase the write offset:
+					newOffset += recordSize
 				}
-
-				//seek to the write offset in the file:
-				// WriteAt uses the explicit offset, so no Seek is needed.
-				//write the record to the file:
-				n, err := newFile.WriteAt(record, newOffset)
-				if err != nil || n != len(record) {
-					_ = currfile.Close()
-					if err != nil {
-						return fmt.Errorf("failed to write record: %w", err)
-					}
-					return fmt.Errorf("incomplete write: wrote %d of %d bytes", n, len(record))
-				}
-				//update the index:
-				compactedEntries[key] = Entry{
-					fileId: newFileID,
-					offset: newOffset,
-					size:   recordSize,
-				}
-
-				//increase the write offset:
-				newOffset += recordSize
 			} else {
 				//stale record skip it:
 			}
@@ -626,7 +659,9 @@ func (db *Bitcask) Compaction() error {
 	for key, entry := range compactedEntries {
 		db.index[key] = entry
 	}
-
+	for key := range tombstoneKeys {
+		delete(db.index, key)
+	}
 	// switch the active file state:
 	oldActiveFile := db.activeFile
 	db.activeFile = nextActiveFile
